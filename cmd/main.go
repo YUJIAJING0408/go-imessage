@@ -4,9 +4,9 @@ import (
 	"log"
 	"net/http"
 
-	"go-imessage/internal/api"
-	"go-imessage/internal/repository"
-	"go-imessage/internal/service"
+	"github.com/YUJIAJING0408/go-imessage/internal/api"
+	"github.com/YUJIAJING0408/go-imessage/internal/repository"
+	"github.com/YUJIAJING0408/go-imessage/internal/service"
 )
 
 func main() {

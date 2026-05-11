@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -361,5 +362,206 @@ func TestStatusRollbackProtection(t *testing.T) {
 	final, _ := repo.GetMessage(msg.ID)
 	if final.Status != model.MessageStatusSent {
 		t.Errorf("状态应保持 sent, 实际 %s", final.Status)
+	}
+}
+
+// TestStartAttempt_OnDeletedMessage_ShouldFail 验证对已删除的消息尝试 StartAttempt 应返回错误，
+// 防止已删除的消息被意外恢复。
+func TestStartAttempt_OnDeletedMessage_ShouldFail(t *testing.T) {
+	repo := newRepo()
+	// 1. 创建一条消息
+	msg, err := createMsg(repo, 1, 2, 10, "待删除消息", "")
+	if err != nil {
+		t.Fatalf("创建消息失败: %v", err)
+	}
+
+	// 2. 删除该消息
+	_, err = repo.DeleteMessage(msg.ID)
+	if err != nil {
+		t.Fatalf("删除消息失败: %v", err)
+	}
+
+	// 3. 尝试对已删除的消息发起 StartAttempt，预期应返回错误
+	_, err = repo.StartAttempt(msg.ID, "ghost-provider")
+	if err == nil {
+		t.Error("期望 StartAttempt 对已删除消息返回错误，但未返回错误")
+	}
+
+	// 4. 确认消息状态未被篡改
+	final, _ := repo.GetMessage(msg.ID)
+	if final.Status != model.MessageStatusDeleted {
+		t.Errorf("已删除消息的状态应保持 deleted, 实际为 %s", final.Status)
+	}
+}
+
+// TestCompleteAttempt_OnDeletedMessage_ShouldNotRevive
+// 验证对已删除消息的 CompleteAttempt 不会将状态重新设为 sent。
+// 场景：消息正在发送时被用户删除，随后服务商成功回调到达，状态应保持 deleted。
+func TestCompleteAttempt_OnDeletedMessage_ShouldNotRevive(t *testing.T) {
+	repo := newRepo()
+	msg, err := createMsg(repo, 1, 2, 10, "竞态删除", "")
+	if err != nil {
+		t.Fatalf("创建消息失败: %v", err)
+	}
+	att, err := repo.StartAttempt(msg.ID, "prov-1")
+	if err != nil {
+		t.Fatalf("启动尝试失败: %v", err)
+	}
+
+	// 模拟并发：先删除消息，后到达成功回调
+	_, err = repo.DeleteMessage(msg.ID)
+	if err != nil {
+		t.Fatalf("删除消息失败: %v", err)
+	}
+
+	// 此时消息已是 deleted，CompleteAttempt 应立即拒绝
+	_, err = repo.CompleteAttempt(att.ID, true, "")
+	if err == nil {
+		t.Error("期望对已删除消息的 CompleteAttempt 返回错误，但未返回错误")
+	}
+
+	// 状态必须是 deleted
+	final, _ := repo.GetMessage(msg.ID)
+	if final.Status != model.MessageStatusDeleted {
+		t.Errorf("状态应保持 deleted, 实际 %s", final.Status)
+	}
+}
+
+// TestCompleteAttempt_OnSentMessage_ShouldNotChange
+// 验证对已成功消息的重复成功回调不会改变状态。
+func TestCompleteAttempt_OnSentMessage_ShouldNotChange(t *testing.T) {
+	repo := newRepo()
+	msg, err := createMsg(repo, 1, 2, 10, "重复成功回调", "")
+	if err != nil {
+		t.Fatalf("创建消息失败: %v", err)
+	}
+	att, err := repo.StartAttempt(msg.ID, "prov-1")
+	if err != nil {
+		t.Fatalf("启动尝试失败: %v", err)
+	}
+
+	// 首次成功
+	_, err = repo.CompleteAttempt(att.ID, true, "")
+	if err != nil {
+		t.Fatalf("首次成功回调失败: %v", err)
+	}
+
+	// 重复成功回调应被拒绝
+	_, err = repo.CompleteAttempt(att.ID, true, "")
+	if err == nil {
+		t.Error("期望对已成功的消息的重试回调返回错误，但未返回错误")
+	}
+
+	final, _ := repo.GetMessage(msg.ID)
+	if final.Status != model.MessageStatusSent {
+		t.Errorf("状态应保持 sent, 实际 %s", final.Status)
+	}
+}
+
+//// TestSaveMessage_VersionConflict 模拟并发覆盖场景：
+//// 1. 读取消息（获取当前版本）
+//// 2. 另一个操作抢先修改了消息（版本+1）
+//// 3. 用旧版本调用 SaveMessage，应返回冲突错误，且数据不被覆盖
+//func TestSaveMessage_VersionConflict(t *testing.T) {
+//	repo := newRepo()
+//	// 创建一条初始消息
+//	msg, err := createMsg(repo, 1, 2, 10, "冲突测试", "")
+//	if err != nil {
+//		t.Fatalf("创建消息失败: %v", err)
+//	}
+//
+//	// 记录当前版本
+//	expectedVersion := msg.Version
+//
+//	// 模拟并发：另一个操作抢先修改了消息（例如发起重试，会变更版本）
+//	// 这里使用 StartAttempt 间接修改消息，因为 StartAttempt 内部会更新消息版本
+//	_, err = repo.StartAttempt(msg.ID, "other-trace")
+//	if err != nil {
+//		t.Fatalf("模拟并发修改失败: %v", err)
+//	}
+//
+//	// 现在尝试用旧版本保存，应返回 ErrVersionConflict
+//	// 注意：调用 SaveMessage 时传入 expectedVersion
+//	conflictMsg := msg // 拷贝原始快照
+//	conflictMsg.Status = model.MessageStatusSending
+//	_, err = repo.SaveMessage(conflictMsg, expectedVersion)
+//	if err == nil {
+//		t.Error("期望返回版本冲突错误，但保存成功（可能覆盖了并发修改）")
+//	}
+//	// 可选：校验错误是否为预期的冲突错误（如果定义了 ErrVersionConflict）
+//	// 同时确认消息状态未被覆盖为 sending（应为 StartAttempt 后的 state）
+//	final, _ := repo.GetMessage(msg.ID) // 获取最新的消息
+//	if final.Status == model.MessageStatusSending && final.ActiveAttemptID != msg.ActiveAttemptID {
+//		// 如果状态被覆盖，说明乐观锁未生效
+//		t.Error("乐观锁失效：旧版本保存覆盖了并发修改后的消息")
+//	}
+//}
+
+// TestSaveMessage_VersionConflict 验证乐观锁：当并发修改了消息后，用旧版本调用 SaveMessage
+// 应返回 ErrVersionConflict，且消息数据保持并发修改后的结果，不被旧快照覆盖。
+func TestSaveMessage_VersionConflict(t *testing.T) {
+	repo := newRepo()
+	msg, err := createMsg(repo, 1, 2, 10, "冲突测试", "")
+	if err != nil {
+		t.Fatalf("创建消息失败: %v", err)
+	}
+
+	// 记录读取时的版本和 ActiveAttemptID
+	expectedVersion := msg.Version
+	oldActiveAttemptID := msg.ActiveAttemptID // 初始为 0
+
+	// 模拟并发：另一个操作抢先修改了消息（例如启动一次发送尝试）
+	attempt, err := repo.StartAttempt(msg.ID, "other-trace")
+	if err != nil {
+		t.Fatalf("模拟并发修改失败: %v", err)
+	}
+	// 此时消息版本已变，ActiveAttemptID 已更新
+	concurrentAttemptID := attempt.ID
+
+	// 用旧快照准备保存
+	conflictMsg := msg // 旧快照（Status 可能为 sending，ActiveAttemptID 为 old）
+	conflictMsg.Status = model.MessageStatusSending
+
+	// 调用 SaveMessage 应返回版本冲突错误
+	_, err = repo.SaveMessage(conflictMsg, expectedVersion)
+	if err == nil {
+		t.Fatal("期望返回版本冲突错误，但保存成功")
+	}
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Errorf("期望 ErrVersionConflict, 实际 %v", err)
+	}
+
+	// 验证数据未被旧快照覆盖
+	final, _ := repo.GetMessage(msg.ID)
+	if final.Version != expectedVersion+1 {
+		t.Errorf("版本应为 %d（仅并发修改增加），实际 %d；若为 %d 则说明乐观锁失效",
+			expectedVersion+1, final.Version, expectedVersion+2)
+	}
+	if final.ActiveAttemptID != concurrentAttemptID {
+		t.Errorf("ActiveAttemptID 应保持并发修改后的值 %d, 实际 %d (可能被旧快照覆盖为 %d)",
+			concurrentAttemptID, final.ActiveAttemptID, oldActiveAttemptID)
+	}
+	if final.Status != model.MessageStatusSending {
+		t.Errorf("消息状态应为并发修改后的 sending, 实际 %s", final.Status)
+	}
+}
+
+// TestSaveMessage_SuccessWhenVersionMatch 正常案例：版本匹配时保存成功
+func TestSaveMessage_SuccessWhenVersionMatch(t *testing.T) {
+	repo := newRepo()
+	msg, err := createMsg(repo, 1, 2, 10, "正常保存", "")
+	if err != nil {
+		t.Fatalf("创建消息失败: %v", err)
+	}
+
+	expectedVersion := msg.Version
+	// 无并发修改，直接保存
+	msg.Status = model.MessageStatusSending
+	saved, err := repo.SaveMessage(msg, expectedVersion)
+	if err != nil {
+		t.Fatalf("版本匹配时应保存成功，但返回错误: %v", err)
+	}
+	if saved.Version != expectedVersion+1 {
+		t.Errorf("期望版本递增为 %d，实际 %d", expectedVersion+1, saved.Version)
 	}
 }
