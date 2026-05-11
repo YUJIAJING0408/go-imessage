@@ -71,7 +71,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	cursor, _ := strconv.ParseInt(r.URL.Query().Get("cursor"), 10, 64)
 	deviceID := r.URL.Query().Get("device_id")
 
-	ctx, reqID := injectRequestID(r)
+	ctx, _ := injectRequestID(r)
 
 	events, next, err := s.svc.Sync(ctx, service.SyncRequest{UserID: userID, DeviceID: deviceID, Cursor: cursor})
 	if err != nil {
