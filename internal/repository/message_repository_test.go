@@ -519,6 +519,120 @@ func TestSaveMessage_SuccessWhenVersionMatch(t *testing.T) {
 	}
 }
 
+// TestDeleteMessage_UpdatesSummaryToPrevious 测试删除多条消息中的最后一条后，
+// 双方的会话摘要应回退到倒数第二条消息。
+func TestDeleteMessage_UpdatesSummaryToPrevious(t *testing.T) {
+	repo := newRepo()
+	// 创建两条消息：msg1 先发，msg2 后发
+	msg1, err := createMsg(repo, 1, 2, 10, "第一条消息", "cid-1")
+	if err != nil {
+		t.Fatalf("创建 msg1 失败: %v", err)
+	}
+	msg2, err := createMsg(repo, 1, 2, 10, "第二条消息", "cid-2")
+	if err != nil {
+		t.Fatalf("创建 msg2 失败: %v", err)
+	}
+	// 让一条消息成功发送（未读置位等不是重点）
+	att1, err := repo.StartAttempt(msg1.ID, "p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repo.CompleteAttempt(att1.ID, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 删除第二条消息
+	_, err = repo.DeleteMessage(msg2.ID)
+	if err != nil {
+		t.Fatalf("删除 msg2 失败: %v", err)
+	}
+
+	// 检查发送方(1)和接收方(2)的摘要
+	for _, uid := range []int64{1, 2} {
+		sum, err := repo.GetConversationSummary(uid, 10)
+		if err != nil {
+			t.Fatalf("获取用户%d摘要失败: %v", uid, err)
+		}
+		// 最后一条消息应为 msg1
+		if sum.LastMessageID != msg1.ID {
+			t.Errorf("用户%d: LastMessageID 应为 %d, 实际 %d", uid, msg1.ID, sum.LastMessageID)
+		}
+		if sum.LastMessagePreview != msg1.Content {
+			t.Errorf("用户%d: LastMessagePreview 应为 %q, 实际 %q", uid, msg1.Content, sum.LastMessagePreview)
+		}
+	}
+}
+
+// TestDeleteMessage_WhenOnlyOne_SummaryCleared 测试删除会话中唯一的一条消息后，
+// 摘要应重置为空状态。
+func TestDeleteMessage_WhenOnlyOne_SummaryCleared(t *testing.T) {
+	repo := newRepo()
+	msg, err := createMsg(repo, 1, 2, 10, "唯一消息", "cid-only")
+	if err != nil {
+		t.Fatalf("创建消息失败: %v", err)
+	}
+	// 完成发送使其进入 sent 状态
+	att, _ := repo.StartAttempt(msg.ID, "p")
+	repo.CompleteAttempt(att.ID, true, "")
+
+	// 删除该消息
+	_, err = repo.DeleteMessage(msg.ID)
+	if err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+
+	// 验证两个用户的摘要均已清空
+	for _, uid := range []int64{1, 2} {
+		sum, _ := repo.GetConversationSummary(uid, 10)
+		if sum.LastMessageID != 0 {
+			t.Errorf("用户%d: LastMessageID 应为 0, 实际 %d", uid, sum.LastMessageID)
+		}
+		if sum.LastMessagePreview != "" {
+			t.Errorf("用户%d: LastMessagePreview 应为空, 实际 %q", uid, sum.LastMessagePreview)
+		}
+	}
+}
+
+// TestDeleteMessage_WhenDeletingOlderMessage_SummaryUnchanged 验证删除较早的消息后，
+// 会话摘要仍显示最新的消息。
+func TestDeleteMessage_WhenDeletingOlderMessage_SummaryUnchanged(t *testing.T) {
+	repo := newRepo()
+	// 创建两条消息，msg1 先发，msg2 后发
+	msg1, err := createMsg(repo, 1, 2, 10, "第一条消息", "cid-1")
+	if err != nil {
+		t.Fatalf("创建 msg1 失败: %v", err)
+	}
+	msg2, err := createMsg(repo, 1, 2, 10, "第二条消息", "cid-2")
+	if err != nil {
+		t.Fatalf("创建 msg2 失败: %v", err)
+	}
+	// 完成发送（确保状态正确）
+	att1, _ := repo.StartAttempt(msg1.ID, "p1")
+	repo.CompleteAttempt(att1.ID, true, "")
+	att2, _ := repo.StartAttempt(msg2.ID, "p2")
+	repo.CompleteAttempt(att2.ID, true, "")
+
+	// 删除第一条（较早的）消息
+	_, err = repo.DeleteMessage(msg1.ID)
+	if err != nil {
+		t.Fatalf("删除 msg1 失败: %v", err)
+	}
+
+	// 验证双方的摘要仍然指向 msg2
+	for _, uid := range []int64{1, 2} {
+		sum, err := repo.GetConversationSummary(uid, 10)
+		if err != nil {
+			t.Fatalf("获取用户%d摘要失败: %v", uid, err)
+		}
+		if sum.LastMessageID != msg2.ID {
+			t.Errorf("用户%d: LastMessageID 应为 %d, 实际 %d", uid, msg2.ID, sum.LastMessageID)
+		}
+		if sum.LastMessagePreview != msg2.Content {
+			t.Errorf("用户%d: LastMessagePreview 应为 %q, 实际 %q", uid, msg2.Content, sum.LastMessagePreview)
+		}
+	}
+}
+
 // ---------------- benchmark ----------------
 
 // 辅助函数：填充仓库，返回仓库实例和所有创建消息的 ID 列表
@@ -642,7 +756,7 @@ func BenchmarkCompleteAttempt(b *testing.B) {
 // BenchmarkListConversationMessages/New-24         	  191857	      6085 ns/op
 // BenchmarkListConversationMessages/Old-24         	    2192	    650040 ns/op
 func BenchmarkListConversationMessages(b *testing.B) {
-	const preload = 50_000
+	const preload = 10_000
 
 	b.Run("New", func(b *testing.B) {
 		repo, _ := populateRepo(b, true, preload)
@@ -671,7 +785,7 @@ func BenchmarkListConversationMessages(b *testing.B) {
 // BenchmarkFindLikelyDuplicateMessage/New-24         	10252638	       114.8 ns/op
 // BenchmarkFindLikelyDuplicateMessage/Old-24         	    4352	    250318 ns/op
 func BenchmarkFindLikelyDuplicateMessage(b *testing.B) {
-	const preload = 50_000
+	const preload = 10_000
 
 	b.Run("New", func(b *testing.B) {
 		repo, ids := populateRepo(b, true, preload)

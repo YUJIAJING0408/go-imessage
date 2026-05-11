@@ -338,6 +338,39 @@ func (r *MemoryMessageRepository) CompleteAttempt(attemptID int64, success bool,
 	return msg, nil
 }
 
+// refreshSummaryAfterDeleteLocked 在删除消息后重新计算指定用户和会话的摘要。
+// 使用会话索引找到最新未被删除的消息来更新，若无消息则清空预览字段。
+// 调用前必须持有写锁。
+func (r *MemoryMessageRepository) refreshSummaryAfterDeleteLocked(userID, conversationID int64) {
+	if userID <= 0 {
+		return
+	}
+	key := summaryKey(userID, conversationID)
+	// 从会话索引中获取该会话的所有消息 ID，按创建时间降序
+	ids := r.messagesByConversation[conversationID]
+	var latest *model.Message
+	for _, id := range ids {
+		if msg, ok := r.messages[id]; ok && msg.Status != model.MessageStatusDeleted {
+			msgCopy := msg
+			latest = &msgCopy
+			break
+		}
+	}
+
+	summary := r.summaries[key]
+	summary.UserID = userID
+	summary.ConversationID = conversationID
+	if latest != nil {
+		summary.LastMessageID = latest.ID
+		summary.LastMessagePreview = latest.Content
+	} else {
+		summary.LastMessageID = 0
+		summary.LastMessagePreview = ""
+	}
+	summary.UpdatedAt = time.Now()
+	r.summaries[key] = summary
+}
+
 // DeleteMessage 将消息标记为已删除。
 // 设置删除时间、状态为 deleted，并广播删除事件给发送方和接收方。
 func (r *MemoryMessageRepository) DeleteMessage(messageID int64) (model.Message, error) {
@@ -357,6 +390,9 @@ func (r *MemoryMessageRepository) DeleteMessage(messageID int64) (model.Message,
 
 	r.appendEventLocked(msg.SenderID, msg, model.EventTypeMessageDeleted)
 	r.appendEventLocked(msg.ReceiverID, msg, model.EventTypeMessageDeleted)
+	// 修复双方的会话摘要
+	r.refreshSummaryAfterDeleteLocked(msg.SenderID, msg.ConversationID)
+	r.refreshSummaryAfterDeleteLocked(msg.ReceiverID, msg.ConversationID)
 	return msg, nil
 }
 
