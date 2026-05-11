@@ -176,6 +176,8 @@ func (r *MemoryMessageRepository) StartAttempt(messageID int64, providerTraceID 
 	return att, nil
 }
 
+// CompleteAttempt finishes a delivery attempt and updates the message status.
+// It prevents unread count inflation: only the first successful attempt increments the receiver's unread.
 func (r *MemoryMessageRepository) CompleteAttempt(attemptID int64, success bool, errorCode string) (model.Message, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -189,30 +191,58 @@ func (r *MemoryMessageRepository) CompleteAttempt(attemptID int64, success bool,
 		return model.Message{}, ErrNotFound
 	}
 
-	prevStatus := msg.Status
 	now := time.Now()
 	att.FinishedAt = &now
 	att.ErrorCode = errorCode
+
 	if success {
 		att.Status = model.AttemptStatusSuccess
 		msg.Status = model.MessageStatusSent
 	} else {
 		att.Status = model.AttemptStatusFailed
-		msg.Status = model.MessageStatusFailed
+		// 检查历史上是否已有成功的 attempt，防止状态回退
+		hadSuccess := false
+		for _, a := range r.attempts {
+			if a.MessageID == msg.ID && a.ID != attemptID && a.Status == model.AttemptStatusSuccess {
+				hadSuccess = true
+				break
+			}
+		}
+		if hadSuccess {
+			// 保持 sent，不回退为 failed
+			msg.Status = model.MessageStatusSent
+		} else {
+			msg.Status = model.MessageStatusFailed
+		}
 	}
+
 	msg.Version++
 	msg.UpdatedAt = now
 
 	r.attempts[attemptID] = att
 	r.messages[msg.ID] = msg
+
+	// Broadcast events to both participants
 	r.appendEventLocked(msg.SenderID, msg, model.EventTypeMessageUpdated)
 	r.appendEventLocked(msg.ReceiverID, msg, model.EventTypeMessageUpdated)
+
+	// Always update sender's conversation summary (preview)
 	r.updateSummaryLocked(msg.SenderID, msg, false)
 
-	// Increment receiver unread only on the first transition to sent
-	if success && prevStatus != model.MessageStatusSent {
-		r.updateSummaryLocked(msg.ReceiverID, msg, true)
+	// Increment receiver unread only if this is the FIRST successful attempt ever
+	if success {
+		alreadyHadSuccess := false
+		for _, a := range r.attempts {
+			if a.MessageID == msg.ID && a.ID != attemptID && a.Status == model.AttemptStatusSuccess {
+				alreadyHadSuccess = true
+				break
+			}
+		}
+		if !alreadyHadSuccess {
+			r.updateSummaryLocked(msg.ReceiverID, msg, true)
+		}
 	}
+
 	return msg, nil
 }
 
