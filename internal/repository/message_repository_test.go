@@ -808,3 +808,49 @@ func BenchmarkFindLikelyDuplicateMessage(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkListEventsAfter 对比 ListEventsAfter 新旧实现性能。
+// 准备 10 万条事件，cursor 设置为 0（从最早开始，旧版需扫描所有事件）。
+// BenchmarkListEventsAfter/New-24         	93161191	        13.66 ns/op
+// BenchmarkListEventsAfter/Old-24         	     145	   7532661 ns/op
+func BenchmarkListEventsAfter(b *testing.B) {
+	const userID = 1
+	const eventCount = 100_000
+
+	setup := func(newVersion bool) *MemoryMessageRepository {
+		repo := NewMemoryMessageRepository()
+		repo.mu.Lock()
+		for i := 0; i < eventCount; i++ {
+			repo.nextEventSeq++
+			seq := repo.nextEventSeq
+			ev := model.SyncEvent{
+				Seq:            seq,
+				UserID:         userID,
+				ConversationID: 10,
+				MessageID:      int64(i + 1),
+				EventType:      model.EventTypeMessageCreated,
+				MessageStatus:  model.MessageStatusSent,
+				CreatedAt:      time.Now(),
+			}
+			repo.events[userID] = append(repo.events[userID], ev)
+		}
+		repo.mu.Unlock()
+		return repo
+	}
+
+	b.Run("New", func(b *testing.B) {
+		repo := setup(true) // 无所谓版本，存储结构相同
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, _ = repo.ListEventsAfter(userID, 0) // cursor=0 最坏情况
+		}
+	})
+
+	b.Run("Old", func(b *testing.B) {
+		repo := setup(false)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, _ = repo.ListEventsAfterOld(userID, 0)
+		}
+	})
+}

@@ -156,3 +156,19 @@ func (r *MemoryMessageRepository) FindLikelyDuplicateMessageOld(senderID, conver
 	}
 	return model.Message{}, ErrNotFound
 }
+
+// Deprecated: 使用 ListEventsAfter 替代，返回用户在给定游标之后的所有同步事件。
+// 游标为 0 时从最早事件开始。结果按 seq 递增顺序（即插入顺序）。
+func (r *MemoryMessageRepository) ListEventsAfterOld(userID int64, cursor int64) ([]model.SyncEvent, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	userEvents := r.events[userID]
+	result := make([]model.SyncEvent, 0)
+	for _, ev := range userEvents {
+		if ev.Seq > cursor {
+			result = append(result, ev)
+		}
+	}
+	return result, nil
+}

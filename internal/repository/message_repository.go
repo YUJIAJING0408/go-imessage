@@ -2,6 +2,7 @@ package repository
 
 import (
 	"errors"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -476,13 +477,16 @@ func (r *MemoryMessageRepository) ListEventsAfter(userID int64, cursor int64) ([
 	defer r.mu.RUnlock()
 
 	userEvents := r.events[userID]
-	result := make([]model.SyncEvent, 0)
-	for _, ev := range userEvents {
-		if ev.Seq > cursor {
-			result = append(result, ev)
-		}
+	if len(userEvents) == 0 {
+		return nil, nil
 	}
-	return result, nil
+
+	// 二分查找第一个 Seq > cursor 的位置
+	start := sort.Search(len(userEvents), func(i int) bool {
+		return userEvents[i].Seq > cursor
+	})
+
+	return userEvents[start:], nil
 }
 
 // GetDeviceCursor 获取设备上一次同步的游标。
