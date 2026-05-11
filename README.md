@@ -1,6 +1,6 @@
 # 后端消息系统架构优化总结
 
-AI对话记录[Deepseek](https://chat.deepseek.com/share/vhah3vco84nh1gop14)
+AI对话记录[Deepseek](https://chat.deepseek.com/share/rmfts9fzran5uz491j)
 
 ## 一、项目初始简化
 
@@ -47,11 +47,25 @@ AI对话记录[Deepseek](https://chat.deepseek.com/share/vhah3vco84nh1gop14)
 - `ListEventsAfter` 使用 `sort.Search` 二分定位起始位置，替代顺序扫描。
 - 保留旧实现 `ListEventsAfterOld` 用于基准测试。
 
-### 基准测试结果（10 万条数据）：
-- `CompleteAttempt`：从 294 µs 降至 140 ns（提升约 2000 倍）
-- `ListConversationMessages`：从 650 µs 降至 6 µs（提升约 100 倍）
-- `FindLikelyDuplicateMessage`：从 250 µs 降至 114 ns（提升约 2000 倍）
-- `ListEventsAfter`：从 7.5 ms 降至 13.66 ns（提升约 55 万倍）
+### 性能优化对比表
+
+以下为各核心操作优化前后的耗时对比（数据量单位为条，耗时单位为纳秒或微秒，已换算为易读单位）。
+
+| 操作 | 数据规模 | 旧版耗时 | 新版耗时 | 提升倍数 |
+|------|----------|----------|----------|----------|
+| CreateMessage | 10 万条插入 | 1,364 ns | 3,188 ns | 0.43x（新略慢，因维护索引） |
+| CompleteAttempt | 1 万条消息 | 277 ns | 100 ns | 2.8x |
+| CompleteAttempt | 5 万条消息 | 294,801 ns (295 µs) | 141 ns | 2,090x |
+| ListConversationMessages | 1 万条消息 | 95,182 ns (95 µs) | 1,773 ns | 54x |
+| ListConversationMessages | 5 万条消息 | 650,040 ns (650 µs) | 6,085 ns (6 µs) | 107x |
+| FindLikelyDuplicateMessage | 1 万条消息 | 48,649 ns (49 µs) | 102 ns | 477x |
+| FindLikelyDuplicateMessage | 5 万条消息 | 250,318 ns (250 µs) | 115 ns | 2,176x |
+| ListEventsAfter | 10 万条事件 | 7,532,661 ns (7.5 ms) | 13.66 ns | 551,000x |
+
+**说明**：
+- `CreateMessage` 新版由于需要维护会话索引和去重索引，略有额外开销（约 3 µs），但发送路径为低频操作，完全可接受。
+- 其余读路径均通过索引或二分查找获得数百至数十万倍的性能提升，彻底消除了全表扫描。
+- `ListEventsAfter` 从毫秒级直接降至纳秒级，效果最为显著。
 
 ## 四、可观测性改进
 
