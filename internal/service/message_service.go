@@ -1,9 +1,10 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -56,9 +57,12 @@ func NewMessageService(repo repository.MessageRepository) *MessageService {
 //  4. 创建消息并立即开始一次发送尝试。
 //
 // 返回创建/已有的消息、新的发送尝试（幂等情况下 attempt 为空）以及错误。
-func (s *MessageService) SendMessage(req SendMessageRequest) (model.Message, model.DeliveryAttempt, error) {
+func (s *MessageService) SendMessage(ctx context.Context, req SendMessageRequest) (model.Message, model.DeliveryAttempt, error) {
 	if req.SenderID <= 0 || req.ReceiverID <= 0 || req.ConversationID <= 0 || strings.TrimSpace(req.Content) == "" {
-		log.Println("send message rejected: invalid request")
+		slog.WarnContext(ctx, "send message rejected",
+			"request_id", req.RequestID,
+			"sender_id", req.SenderID,
+			"receiver_id", req.ReceiverID)
 		return model.Message{}, model.DeliveryAttempt{}, errors.New("invalid request")
 	}
 
@@ -91,14 +95,24 @@ func (s *MessageService) SendMessage(req SendMessageRequest) (model.Message, mod
 
 	saved, err := s.repo.CreateMessage(msg)
 	if err != nil {
-		log.Println("send message create failed:", err)
+		slog.ErrorContext(ctx, "create message failed",
+			"request_id", req.RequestID,
+			"sender_id", req.SenderID,
+			"msg_id", saved.ID,
+			"error", err,
+		)
 		return model.Message{}, model.DeliveryAttempt{}, err
 	}
 
 	// 启动发送尝试
 	attempt, err := s.repo.StartAttempt(saved.ID, fmt.Sprintf("provider-%d", saved.ID))
 	if err != nil {
-		log.Println("send attempt start failed:", err)
+		slog.ErrorContext(ctx, "start attempt failed",
+			"request_id", req.RequestID,
+			"sender_id", req.SenderID,
+			"msg_id", saved.ID,
+			"error", err,
+		)
 		return saved, model.DeliveryAttempt{}, err
 	}
 	return saved, attempt, nil
@@ -106,23 +120,30 @@ func (s *MessageService) SendMessage(req SendMessageRequest) (model.Message, mod
 
 // CompleteAttempt 完成一次发送尝试。
 // 直接委托给仓储层，仓储层会处理状态变更、事件广播和未读更新。
-func (s *MessageService) CompleteAttempt(req CompleteAttemptRequest) (model.Message, error) {
+func (s *MessageService) CompleteAttempt(ctx context.Context, req CompleteAttemptRequest) (model.Message, error) {
 	if req.AttemptID <= 0 {
 		return model.Message{}, errors.New("attempt_id is required")
 	}
 	msg, err := s.repo.CompleteAttempt(req.AttemptID, req.Success, req.ErrorCode)
 	if err != nil {
-		log.Println("complete attempt failed:", err)
+		slog.ErrorContext(ctx, "complete attempt failed",
+			"request_id", req.RequestID,
+			"attempt_id", req.AttemptID,
+			"error", err,
+		)
 	}
 	return msg, err
 }
 
 // RetryMessage 重新发送一条消息。
 // 将消息状态重置为 sending，刷新发送方会话预览，并创建新的发送尝试。
-func (s *MessageService) RetryMessage(messageID int64) (model.Message, model.DeliveryAttempt, error) {
+func (s *MessageService) RetryMessage(ctx context.Context, messageID int64) (model.Message, model.DeliveryAttempt, error) {
 	msg, err := s.repo.GetMessage(messageID)
 	if err != nil {
-		log.Println("retry load message failed:", err)
+		slog.ErrorContext(ctx, "retry load message failed",
+			"msg_id", messageID,
+			"error", err,
+		)
 		return model.Message{}, model.DeliveryAttempt{}, err
 	}
 	// 记录期望版本，防止并发覆盖
@@ -131,7 +152,10 @@ func (s *MessageService) RetryMessage(messageID int64) (model.Message, model.Del
 	// 传入期望版本保存
 	msg, err = s.repo.SaveMessage(msg, expectedVersion)
 	if err != nil {
-		log.Println("retry save message failed:", err)
+		slog.ErrorContext(ctx, "retry save message failed",
+			"msg_id", messageID,
+			"error", err,
+		)
 		return model.Message{}, model.DeliveryAttempt{}, err
 	}
 
@@ -140,7 +164,10 @@ func (s *MessageService) RetryMessage(messageID int64) (model.Message, model.Del
 
 	attempt, err := s.repo.StartAttempt(msg.ID, fmt.Sprintf("retry-%d", msg.ID))
 	if err != nil {
-		log.Println("retry start attempt failed:", err)
+		slog.ErrorContext(ctx, "retry start attempt failed",
+			"msg_id", messageID,
+			"error", err,
+		)
 		return msg, model.DeliveryAttempt{}, err
 	}
 	return msg, attempt, nil
@@ -191,7 +218,7 @@ func (s *MessageService) DeleteMessage(messageID int64) (model.Message, error) {
 
 // Sync 返回用户自某个游标之后的增量事件，并更新设备游标。
 // 若请求游标为 0，则使用最近保存的设备游标作为起点。
-func (s *MessageService) Sync(req SyncRequest) ([]model.SyncEvent, int64, error) {
+func (s *MessageService) Sync(ctx context.Context, req SyncRequest) ([]model.SyncEvent, int64, error) {
 	cursor := req.Cursor
 	if cursor == 0 {
 		cursor = s.repo.GetDeviceCursor(req.UserID, req.DeviceID)
