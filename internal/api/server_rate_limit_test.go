@@ -15,7 +15,7 @@ import (
 // 辅助函数：创建测试 Server 和请求包装
 func newTestServer() *Server {
 	repo := repository.NewMemoryMessageRepository()
-	svc := service.NewMessageService(repo)
+	svc := service.NewMessageService(repo, time.Second*30)
 	return NewServer(svc)
 }
 
