@@ -5,23 +5,72 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/YUJIAJING0408/go-imessage/internal/service"
 	"github.com/google/uuid"
+	"golang.org/x/time/rate"
 )
 
 type contextKey string
 
 const requestIDKey contextKey = "request_id"
 
+// 限流配置
+const (
+	rateLimitPerSecond = 5                // 每秒产生 5 个令牌
+	burstSize          = 10               // 允许的最大突发请求数
+	cleanupInterval    = 10 * time.Minute // 清理过期限流器的时间间隔
+	limiterTTL         = 5 * time.Minute  // 限流器上次使用后存活时间
+)
+
+// limiterEntry 包装 rate.Limiter 并记录最后访问时间，用于后台清理。
+type limiterEntry struct {
+	limiter  *rate.Limiter
+	lastUsed time.Time
+}
+
 // Server 是 HTTP API 的适配器，持有 MessageService 实例。
 type Server struct {
-	svc *service.MessageService
+	svc      *service.MessageService
+	limiters sync.Map // key: senderID (string), value: *limiterEntry
+}
+
+// cleanupLimiters 后台定期清理长时间未使用的限流器，防止内存泄漏。
+func (s *Server) cleanupLimiters() {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		s.limiters.Range(func(key, value interface{}) bool {
+			entry := value.(*limiterEntry)
+			if now.Sub(entry.lastUsed) > limiterTTL {
+				s.limiters.Delete(key)
+			}
+			return true
+		})
+	}
+}
+
+// getLimiter 获取或创建指定 senderID 的限流器。
+func (s *Server) getLimiter(senderID int64) *rate.Limiter {
+	key := strconv.FormatInt(senderID, 10)
+	entryAny, _ := s.limiters.LoadOrStore(key, &limiterEntry{
+		limiter:  rate.NewLimiter(rateLimitPerSecond, burstSize),
+		lastUsed: time.Now(),
+	})
+	entry := entryAny.(*limiterEntry)
+	// 更新最近使用时间（允许轻微竞态，但无副作用）
+	entry.lastUsed = time.Now()
+	return entry.limiter
 }
 
 // NewServer 创建一个新的 Server 实例。
 func NewServer(svc *service.MessageService) *Server {
-	return &Server{svc: svc}
+	var s = &Server{svc: svc}
+	go s.cleanupLimiters()
+	return s
 }
 
 // Register 向 http.ServeMux 注册路由。
@@ -56,6 +105,13 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.RequestID = reqID
+
+	limiter := s.getLimiter(req.SenderID)
+	if !limiter.Allow() {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+
 	msg, attempt, err := s.svc.SendMessage(ctx, req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)

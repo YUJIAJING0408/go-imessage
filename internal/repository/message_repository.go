@@ -30,7 +30,7 @@ type MessageRepository interface {
 	MarkConversationRead(userID int64, conversationID int64) error
 	ListEventsAfter(userID int64, cursor int64) ([]model.SyncEvent, error)
 	GetDeviceCursor(userID int64, deviceID string) int64
-	SaveDeviceCursor(userID int64, deviceID string, cursor int64)
+	SaveDeviceCursor(userID int64, deviceID string, cursor int64) error
 	FindLikelyDuplicateMessage(senderID, conversationID int64, content string, within time.Duration) (model.Message, error)
 	RefreshSenderPreview(userID, conversationID int64, msg model.Message)
 }
@@ -44,22 +44,6 @@ type MessageRepository interface {
 //	summaries     - "userID:conversationID" -> ConversationSummary
 //	deviceCursors - "userID:deviceID" -> 游标值
 //	clientMsgIndex- "senderID:clientMsgID" -> 消息 ID（用于幂等）
-//type MemoryMessageRepository struct {
-//	mu sync.RWMutex
-//
-//	nextMessageID int64
-//	nextAttemptID int64
-//	nextEventSeq  int64
-//
-//	messages      map[int64]model.Message
-//	attempts      map[int64]model.DeliveryAttempt
-//	events        map[int64][]model.SyncEvent
-//	summaries     map[string]model.ConversationSummary
-//	deviceCursors map[string]int64
-//
-//	clientMsgIndex map[string]int64
-//}
-
 type MemoryMessageRepository struct {
 	mu sync.RWMutex
 
@@ -497,10 +481,11 @@ func (r *MemoryMessageRepository) GetDeviceCursor(userID int64, deviceID string)
 }
 
 // SaveDeviceCursor 保存设备的最新同步游标。
-func (r *MemoryMessageRepository) SaveDeviceCursor(userID int64, deviceID string, cursor int64) {
+func (r *MemoryMessageRepository) SaveDeviceCursor(userID int64, deviceID string, cursor int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.deviceCursors[deviceKey(userID, deviceID)] = cursor
+	return nil // 内存实现永远成功
 }
 
 // FindLikelyDuplicateMessage 搜索在指定时间窗口内，同一会话中内容相同的消息。

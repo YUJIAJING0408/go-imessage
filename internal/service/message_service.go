@@ -41,12 +41,13 @@ type SyncRequest struct {
 
 // MessageService 是消息业务逻辑的核心服务，依赖 MessageRepository 进行持久化。
 type MessageService struct {
-	repo repository.MessageRepository
+	repo         repository.MessageRepository
+	dedupeWindow time.Duration
 }
 
 // NewMessageService 创建新的 MessageService 实例。
-func NewMessageService(repo repository.MessageRepository) *MessageService {
-	return &MessageService{repo: repo}
+func NewMessageService(repo repository.MessageRepository, dedupeWindow time.Duration) *MessageService {
+	return &MessageService{repo: repo, dedupeWindow: dedupeWindow}
 }
 
 // SendMessage 处理发送消息的完整逻辑。
@@ -76,7 +77,7 @@ func (s *MessageService) SendMessage(ctx context.Context, req SendMessageRequest
 
 	// 2. 无 clientMsgID 时的内容去重（30 秒内相同会话相同内容视为重复）
 	if strings.TrimSpace(req.ClientMsgID) == "" {
-		dup, err := s.repo.FindLikelyDuplicateMessage(req.SenderID, req.ConversationID, req.Content, 30*time.Second)
+		dup, err := s.repo.FindLikelyDuplicateMessage(req.SenderID, req.ConversationID, req.Content, s.dedupeWindow)
 		if err == nil {
 			return dup, model.DeliveryAttempt{}, nil
 		}
@@ -236,6 +237,12 @@ func (s *MessageService) Sync(ctx context.Context, req SyncRequest) ([]model.Syn
 			nextCursor = ev.Seq
 		}
 	}
-	s.repo.SaveDeviceCursor(req.UserID, req.DeviceID, nextCursor)
+	if err := s.repo.SaveDeviceCursor(req.UserID, req.DeviceID, nextCursor); err != nil {
+		slog.ErrorContext(ctx, "save device cursor failed",
+			"user_id", req.UserID,
+			"device_id", req.DeviceID,
+			"error", err,
+		)
+	}
 	return events, nextCursor, nil
 }
