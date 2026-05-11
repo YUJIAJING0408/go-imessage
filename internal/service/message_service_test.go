@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/YUJIAJING0408/go-imessage/internal/logger"
 	"github.com/YUJIAJING0408/go-imessage/internal/model"
@@ -12,7 +13,7 @@ import (
 
 // newSvc 创建一个使用内存仓库的服务实例
 func newSvc() *MessageService {
-	return NewMessageService(repository.NewMemoryMessageRepository())
+	return NewMessageService(repository.NewMemoryMessageRepository(), time.Second*30)
 }
 
 func TestMain(m *testing.M) {
