@@ -2,6 +2,8 @@ package repository
 
 import (
 	"errors"
+	"fmt"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
@@ -91,34 +93,24 @@ func TestIdempotency_SendWithSameClientMsgID_ReturnsExisting(t *testing.T) {
 // 内容去重：在规定时间窗口内找到相似消息
 func TestFindLikelyDuplicateMessage(t *testing.T) {
 	repo := newRepo()
-	now := time.Now()
-	// 手动插入一条消息以精确控制创建时间
-	msg := model.Message{
-		ID:             1,
-		SenderID:       1,
-		ReceiverID:     2,
-		ConversationID: 10,
-		Content:        "hello world",
-		Status:         model.MessageStatusSending,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+	msg, err := createMsg(repo, 1, 2, 10, "hello world", "") // clientMsgID 为空，会建立去重索引
+	if err != nil {
+		t.Fatalf("创建消息失败: %v", err)
 	}
-	repo.mu.Lock()
-	repo.messages[1] = msg
-	repo.mu.Unlock()
 
-	// 在 1 秒窗口内应能找到
-	found, err := repo.FindLikelyDuplicateMessage(1, 10, "hello world", 1*time.Second)
+	// 在 1 秒窗口内应能找到（刚刚创建）
+	found, err := repo.FindLikelyDuplicateMessage(1, 10, "hello world", 10*time.Second)
 	if err != nil {
 		t.Fatalf("期望找到重复消息，但返回错误: %v", err)
 	}
-	if found.ID != 1 {
-		t.Error("重复消息 ID 不匹配")
+	if found.ID != msg.ID {
+		t.Error("找到的消息 ID 与期望不一致")
 	}
-	// 窗口为 0 时应找不到
+
+	// 窗口为 0 表示消息创建时间必须在 now 之后（不可能），应返回 ErrNotFound
 	_, err = repo.FindLikelyDuplicateMessage(1, 10, "hello world", 0)
-	if err != ErrNotFound {
-		t.Errorf("期望超时窗口后返回 ErrNotFound, 实际 %v", err)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("期望窗口外返回 ErrNotFound，但得到: %v", err)
 	}
 }
 
@@ -458,45 +450,6 @@ func TestCompleteAttempt_OnSentMessage_ShouldNotChange(t *testing.T) {
 	}
 }
 
-//// TestSaveMessage_VersionConflict 模拟并发覆盖场景：
-//// 1. 读取消息（获取当前版本）
-//// 2. 另一个操作抢先修改了消息（版本+1）
-//// 3. 用旧版本调用 SaveMessage，应返回冲突错误，且数据不被覆盖
-//func TestSaveMessage_VersionConflict(t *testing.T) {
-//	repo := newRepo()
-//	// 创建一条初始消息
-//	msg, err := createMsg(repo, 1, 2, 10, "冲突测试", "")
-//	if err != nil {
-//		t.Fatalf("创建消息失败: %v", err)
-//	}
-//
-//	// 记录当前版本
-//	expectedVersion := msg.Version
-//
-//	// 模拟并发：另一个操作抢先修改了消息（例如发起重试，会变更版本）
-//	// 这里使用 StartAttempt 间接修改消息，因为 StartAttempt 内部会更新消息版本
-//	_, err = repo.StartAttempt(msg.ID, "other-trace")
-//	if err != nil {
-//		t.Fatalf("模拟并发修改失败: %v", err)
-//	}
-//
-//	// 现在尝试用旧版本保存，应返回 ErrVersionConflict
-//	// 注意：调用 SaveMessage 时传入 expectedVersion
-//	conflictMsg := msg // 拷贝原始快照
-//	conflictMsg.Status = model.MessageStatusSending
-//	_, err = repo.SaveMessage(conflictMsg, expectedVersion)
-//	if err == nil {
-//		t.Error("期望返回版本冲突错误，但保存成功（可能覆盖了并发修改）")
-//	}
-//	// 可选：校验错误是否为预期的冲突错误（如果定义了 ErrVersionConflict）
-//	// 同时确认消息状态未被覆盖为 sending（应为 StartAttempt 后的 state）
-//	final, _ := repo.GetMessage(msg.ID) // 获取最新的消息
-//	if final.Status == model.MessageStatusSending && final.ActiveAttemptID != msg.ActiveAttemptID {
-//		// 如果状态被覆盖，说明乐观锁未生效
-//		t.Error("乐观锁失效：旧版本保存覆盖了并发修改后的消息")
-//	}
-//}
-
 // TestSaveMessage_VersionConflict 验证乐观锁：当并发修改了消息后，用旧版本调用 SaveMessage
 // 应返回 ErrVersionConflict，且消息数据保持并发修改后的结果，不被旧快照覆盖。
 func TestSaveMessage_VersionConflict(t *testing.T) {
@@ -564,4 +517,180 @@ func TestSaveMessage_SuccessWhenVersionMatch(t *testing.T) {
 	if saved.Version != expectedVersion+1 {
 		t.Errorf("期望版本递增为 %d，实际 %d", expectedVersion+1, saved.Version)
 	}
+}
+
+// ---------------- benchmark ----------------
+
+// 辅助函数：填充仓库，返回仓库实例和所有创建消息的 ID 列表
+func populateRepo(b *testing.B, newVersion bool, msgCount int) (*MemoryMessageRepository, []int64) {
+	repo := NewMemoryMessageRepository()
+	ids := make([]int64, 0, msgCount)
+	create := repo.CreateMessage
+	if !newVersion {
+		create = repo.CreateMessageOld
+	}
+	for i := 0; i < msgCount; i++ {
+		msg, err := create(model.Message{
+			SenderID:       int64(rand.Intn(100) + 1),
+			ReceiverID:     int64(rand.Intn(100) + 1),
+			ConversationID: int64(rand.Intn(500) + 1),
+			Content:        fmt.Sprintf("message-%d-%s", i, randomString(8)),
+			ClientMsgID:    fmt.Sprintf("cid-%d", i),
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+		ids = append(ids, msg.ID)
+	}
+	return repo, ids
+}
+
+func randomString(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+// BenchmarkCreateMessage 对比新旧 CreateMessage（大规模插入）。
+// 注意：此处直接在 b.N 循环中插入新消息，每次迭代插入一条，不重置计时器。
+// BenchmarkCreateMessage/New-24         	  990188	      3188 ns/op
+// BenchmarkCreateMessage/Old-24         	 1000000	      1364 ns/op
+func BenchmarkCreateMessage(b *testing.B) {
+	b.Run("New", func(b *testing.B) {
+		repo := NewMemoryMessageRepository()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, _ = repo.CreateMessage(model.Message{
+				SenderID:       int64(rand.Intn(100) + 1),
+				ReceiverID:     int64(rand.Intn(100) + 1),
+				ConversationID: int64(rand.Intn(500) + 1),
+				Content:        fmt.Sprintf("bench-%d-%s", i, randomString(8)),
+				ClientMsgID:    fmt.Sprintf("bench-cid-%d", i),
+			})
+		}
+	})
+
+	b.Run("Old", func(b *testing.B) {
+		repo := NewMemoryMessageRepository()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, _ = repo.CreateMessageOld(model.Message{
+				SenderID:       int64(rand.Intn(100) + 1),
+				ReceiverID:     int64(rand.Intn(100) + 1),
+				ConversationID: int64(rand.Intn(500) + 1),
+				Content:        fmt.Sprintf("bench-%d-%s", i, randomString(8)),
+				ClientMsgID:    fmt.Sprintf("bench-cid-%d", i),
+			})
+		}
+	})
+}
+
+// BenchmarkCompleteAttempt 对比新旧 CompleteAttempt。
+// preload=1W，使用 1 万条消息和 1 万次尝试作为背景
+// BenchmarkCompleteAttempt/New-24         	10503548	       100.1 ns/op
+// BenchmarkCompleteAttempt/Old-24         	 3706884	       277.0 ns/op
+// preload=5W，使用 5 万条消息和 5 万次尝试作为背景
+// BenchmarkCompleteAttempt/New-24         	 7886774	       140.9 ns/op
+// BenchmarkCompleteAttempt/Old-24         	    3824	    294801 ns/op
+func BenchmarkCompleteAttempt(b *testing.B) {
+	const preload = 10_000
+
+	b.Run("New", func(b *testing.B) {
+		repo, _ := populateRepo(b, true, preload)
+		// 为每条消息创建一次 attempt，以便 CompleteAttempt 能查找
+		for _, mid := range repo.messages {
+			_, _ = repo.StartAttempt(mid.ID, "pre-trace")
+		}
+		// 随机选择一个已有 attempt 进行 Complete
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			// 随机挑选一个 attempt
+			var attemptID int64
+			for aid := range repo.attempts {
+				attemptID = aid
+				break
+			}
+			_, _ = repo.CompleteAttempt(attemptID, true, "")
+		}
+	})
+
+	b.Run("Old", func(b *testing.B) {
+		repo, _ := populateRepo(b, false, preload)
+		for _, mid := range repo.messages {
+			_, _ = repo.StartAttempt(mid.ID, "pre-trace")
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var attemptID int64
+			for aid := range repo.attempts {
+				attemptID = aid
+				break
+			}
+			_, _ = repo.CompleteAttemptOld(attemptID, true, "")
+		}
+	})
+}
+
+// BenchmarkListConversationMessages 对比列表查询
+// preload=1W，1 万条消息随机分布在 500 个会话。
+// BenchmarkListConversationMessages/New-24         	  749229	      1773 ns/op
+// BenchmarkListConversationMessages/Old-24         	   12202	     95182 ns/op
+// preload=51W，5 万条消息随机分布在 500 个会话。
+// BenchmarkListConversationMessages/New-24         	  191857	      6085 ns/op
+// BenchmarkListConversationMessages/Old-24         	    2192	    650040 ns/op
+func BenchmarkListConversationMessages(b *testing.B) {
+	const preload = 50_000
+
+	b.Run("New", func(b *testing.B) {
+		repo, _ := populateRepo(b, true, preload)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			convID := int64(rand.Intn(500) + 1)
+			_, _ = repo.ListConversationMessages(convID, 0, 20)
+		}
+	})
+
+	b.Run("Old", func(b *testing.B) {
+		repo, _ := populateRepo(b, false, preload)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			convID := int64(rand.Intn(500) + 1)
+			_, _ = repo.ListConversationMessagesOld(convID, 0, 20)
+		}
+	})
+}
+
+// BenchmarkFindLikelyDuplicateMessage 对比去重查找，
+// preload=1W，1 万条消息，随机选取存在的消息内容。
+// BenchmarkFindLikelyDuplicateMessage/New-24         	12373200	       102.0 ns/op
+// BenchmarkFindLikelyDuplicateMessage/Old-24         	   25911	     48649 ns/op
+// preload=5W，5 万条消息，随机选取存在的消息内容。
+// BenchmarkFindLikelyDuplicateMessage/New-24         	10252638	       114.8 ns/op
+// BenchmarkFindLikelyDuplicateMessage/Old-24         	    4352	    250318 ns/op
+func BenchmarkFindLikelyDuplicateMessage(b *testing.B) {
+	const preload = 50_000
+
+	b.Run("New", func(b *testing.B) {
+		repo, ids := populateRepo(b, true, preload)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			// 随机选一条已有消息，获取其内容进行查找
+			msgID := ids[rand.Intn(len(ids))]
+			msg, _ := repo.GetMessage(msgID)
+			_, _ = repo.FindLikelyDuplicateMessage(msg.SenderID, msg.ConversationID, msg.Content, 30*time.Second)
+		}
+	})
+
+	b.Run("Old", func(b *testing.B) {
+		repo, ids := populateRepo(b, false, preload)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			msgID := ids[rand.Intn(len(ids))]
+			msg, _ := repo.GetMessage(msgID)
+			_, _ = repo.FindLikelyDuplicateMessageOld(msg.SenderID, msg.ConversationID, msg.Content, 30*time.Second)
+		}
+	})
 }

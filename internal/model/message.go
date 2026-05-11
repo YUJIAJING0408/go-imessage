@@ -44,19 +44,20 @@ const (
 //	UpdatedAt       - 最后更新时间
 //	DeletedAt       - 删除时间（非nil表示已删除）
 type Message struct {
-	ID              int64      `json:"id"`
-	SenderID        int64      `json:"sender_id"`
-	ReceiverID      int64      `json:"receiver_id"`
-	DeviceID        string     `json:"device_id"`
-	ConversationID  int64      `json:"conversation_id"`
-	ClientMsgID     string     `json:"client_msg_id"`
-	Content         string     `json:"content"`
-	Status          string     `json:"status"`
-	ActiveAttemptID int64      `json:"active_attempt_id"`
-	Version         int64      `json:"version"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
-	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
+	ID               int64      `json:"id"`
+	SenderID         int64      `json:"sender_id"`
+	ReceiverID       int64      `json:"receiver_id"`
+	DeviceID         string     `json:"device_id"`
+	ConversationID   int64      `json:"conversation_id"`
+	ClientMsgID      string     `json:"client_msg_id"`
+	Content          string     `json:"content"`
+	Status           string     `json:"status"`
+	HasEverSucceeded bool       `json:"has_ever_succeeded"`
+	ActiveAttemptID  int64      `json:"active_attempt_id"`
+	Version          int64      `json:"version"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
 }
 
 // DeliveryAttempt 表示消息的一次发送尝试。

@@ -2,7 +2,6 @@ package repository
 
 import (
 	"errors"
-	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -44,6 +43,22 @@ type MessageRepository interface {
 //	summaries     - "userID:conversationID" -> ConversationSummary
 //	deviceCursors - "userID:deviceID" -> 游标值
 //	clientMsgIndex- "senderID:clientMsgID" -> 消息 ID（用于幂等）
+//type MemoryMessageRepository struct {
+//	mu sync.RWMutex
+//
+//	nextMessageID int64
+//	nextAttemptID int64
+//	nextEventSeq  int64
+//
+//	messages      map[int64]model.Message
+//	attempts      map[int64]model.DeliveryAttempt
+//	events        map[int64][]model.SyncEvent
+//	summaries     map[string]model.ConversationSummary
+//	deviceCursors map[string]int64
+//
+//	clientMsgIndex map[string]int64
+//}
+
 type MemoryMessageRepository struct {
 	mu sync.RWMutex
 
@@ -57,21 +72,41 @@ type MemoryMessageRepository struct {
 	summaries     map[string]model.ConversationSummary
 	deviceCursors map[string]int64
 
-	clientMsgIndex map[string]int64
+	clientMsgIndex map[string]int64 // "senderID:clientMsgID" -> messageID
+
+	// 性能优化索引
+	messagesByConversation map[int64][]int64 // conversationID -> 消息ID列表（按创建时间降序）
+	duplicateIndex         map[string]int64  // "senderID:conversationID:content" -> 最近的消息ID
 }
 
 // NewMemoryMessageRepository 创建一个新的内存仓储实例，初始化所有 map 和计数器。
+//
+//	func NewMemoryMessageRepository() *MemoryMessageRepository {
+//		return &MemoryMessageRepository{
+//			nextMessageID:  1,
+//			nextAttemptID:  1,
+//			nextEventSeq:   1,
+//			messages:       make(map[int64]model.Message),
+//			attempts:       make(map[int64]model.DeliveryAttempt),
+//			events:         make(map[int64][]model.SyncEvent),
+//			summaries:      make(map[string]model.ConversationSummary),
+//			deviceCursors:  make(map[string]int64),
+//			clientMsgIndex: make(map[string]int64),
+//		}
+//	}
 func NewMemoryMessageRepository() *MemoryMessageRepository {
 	return &MemoryMessageRepository{
-		nextMessageID:  1,
-		nextAttemptID:  1,
-		nextEventSeq:   1,
-		messages:       make(map[int64]model.Message),
-		attempts:       make(map[int64]model.DeliveryAttempt),
-		events:         make(map[int64][]model.SyncEvent),
-		summaries:      make(map[string]model.ConversationSummary),
-		deviceCursors:  make(map[string]int64),
-		clientMsgIndex: make(map[string]int64),
+		nextMessageID:          1,
+		nextAttemptID:          1,
+		nextEventSeq:           1,
+		messages:               make(map[int64]model.Message),
+		attempts:               make(map[int64]model.DeliveryAttempt),
+		events:                 make(map[int64][]model.SyncEvent),
+		summaries:              make(map[string]model.ConversationSummary),
+		deviceCursors:          make(map[string]int64),
+		clientMsgIndex:         make(map[string]int64),
+		messagesByConversation: make(map[int64][]int64),
+		duplicateIndex:         make(map[string]int64),
 	}
 }
 
@@ -110,10 +145,24 @@ func (r *MemoryMessageRepository) CreateMessage(msg model.Message) (model.Messag
 	msg.Version = 1
 	r.messages[msg.ID] = msg
 
+	// 幂等索引：clientMsgID
 	if msg.ClientMsgID != "" {
 		idxKey := strconv.FormatInt(msg.SenderID, 10) + ":" + msg.ClientMsgID
 		r.clientMsgIndex[idxKey] = msg.ID
 	}
+
+	// 去重索引（仅当无 clientMsgID 时建立）
+	if msg.ClientMsgID == "" {
+		dupKey := strconv.FormatInt(msg.SenderID, 10) + ":" +
+			strconv.FormatInt(msg.ConversationID, 10) + ":" + msg.Content
+		r.duplicateIndex[dupKey] = msg.ID
+	}
+
+	// 会话索引：插入到列表头部，保持降序
+	r.messagesByConversation[msg.ConversationID] = append(
+		[]int64{msg.ID},
+		r.messagesByConversation[msg.ConversationID]...,
+	)
 
 	r.appendEventLocked(msg.SenderID, msg, model.EventTypeMessageCreated)
 	r.updateSummaryLocked(msg.SenderID, msg, false)
@@ -253,20 +302,17 @@ func (r *MemoryMessageRepository) CompleteAttempt(attemptID int64, success bool,
 	att.FinishedAt = &now
 	att.ErrorCode = errorCode
 
+	// 记录更新前是否已成功，用于未读计数
+	wasAlreadySent := msg.HasEverSucceeded
+
 	if success {
 		att.Status = model.AttemptStatusSuccess
 		msg.Status = model.MessageStatusSent
+		msg.HasEverSucceeded = true
 	} else {
 		att.Status = model.AttemptStatusFailed
-		// 检查是否已经有过成功的尝试，若有则保持 sent 状态不变
-		hadSuccess := false
-		for _, a := range r.attempts {
-			if a.MessageID == msg.ID && a.ID != attemptID && a.Status == model.AttemptStatusSuccess {
-				hadSuccess = true
-				break
-			}
-		}
-		if hadSuccess {
+		if wasAlreadySent {
+			// 保持 sent，防止状态回退
 			msg.Status = model.MessageStatusSent
 		} else {
 			msg.Status = model.MessageStatusFailed
@@ -279,25 +325,14 @@ func (r *MemoryMessageRepository) CompleteAttempt(attemptID int64, success bool,
 	r.attempts[attemptID] = att
 	r.messages[msg.ID] = msg
 
-	// 向双方广播状态变更事件
 	r.appendEventLocked(msg.SenderID, msg, model.EventTypeMessageUpdated)
 	r.appendEventLocked(msg.ReceiverID, msg, model.EventTypeMessageUpdated)
 
-	// 总是更新发送方会话摘要（预览）
 	r.updateSummaryLocked(msg.SenderID, msg, false)
 
-	// 仅在首次成功时增加接收方未读数
-	if success {
-		alreadyHadSuccess := false
-		for _, a := range r.attempts {
-			if a.MessageID == msg.ID && a.ID != attemptID && a.Status == model.AttemptStatusSuccess {
-				alreadyHadSuccess = true
-				break
-			}
-		}
-		if !alreadyHadSuccess {
-			r.updateSummaryLocked(msg.ReceiverID, msg, true)
-		}
+	// 首次成功才增加接收方未读数
+	if success && !wasAlreadySent {
+		r.updateSummaryLocked(msg.ReceiverID, msg, true)
 	}
 
 	return msg, nil
@@ -332,23 +367,28 @@ func (r *MemoryMessageRepository) ListConversationMessages(conversationID int64,
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	items := make([]model.Message, 0)
-	for _, msg := range r.messages {
-		if msg.ConversationID == conversationID && msg.Status != model.MessageStatusDeleted {
-			items = append(items, msg)
+	ids := r.messagesByConversation[conversationID]
+	result := make([]model.Message, 0, len(ids))
+	for _, id := range ids {
+		msg, ok := r.messages[id]
+		if !ok {
+			continue // 防御性忽略
 		}
+		if msg.Status == model.MessageStatusDeleted {
+			continue
+		}
+		result = append(result, msg)
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].CreatedAt.After(items[j].CreatedAt)
-	})
-	if offset >= len(items) {
+
+	// result 已按创建时间降序（因为插入时头部加入）
+	if offset >= len(result) {
 		return []model.Message{}, nil
 	}
 	end := offset + limit
-	if end > len(items) {
-		end = len(items)
+	if end > len(result) {
+		end = len(result)
 	}
-	return items[offset:end], nil
+	return result[offset:end], nil
 }
 
 // CountAttempts 统计某条消息的发送尝试次数。
@@ -430,14 +470,20 @@ func (r *MemoryMessageRepository) FindLikelyDuplicateMessage(senderID, conversat
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	cutoff := time.Now().Add(-within)
-	for _, msg := range r.messages {
-		if msg.SenderID == senderID &&
-			msg.ConversationID == conversationID &&
-			msg.Content == content &&
-			msg.CreatedAt.After(cutoff) {
+	// 非正窗口直接拒绝（包括 0）
+	if within <= 0 {
+		return model.Message{}, ErrNotFound
+	}
+
+	key := strconv.FormatInt(senderID, 10) + ":" +
+		strconv.FormatInt(conversationID, 10) + ":" + content
+
+	if id, ok := r.duplicateIndex[key]; ok {
+		msg, exists := r.messages[id]
+		if exists && time.Since(msg.CreatedAt) <= within {
 			return msg, nil
 		}
+		// 窗口外可惰性删除过期的索引，此处省略，不影响正确性
 	}
 	return model.Message{}, ErrNotFound
 }
