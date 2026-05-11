@@ -1,5 +1,7 @@
 # 后端消息系统架构优化总结
 
+AI对话记录[Deepseek](https://chat.deepseek.com/share/vhah3vco84nh1gop14)
+
 ## 一、项目初始简化
 
 - 保留了 `cmd/main.go`、`internal/api`、`internal/service`、`internal/repository`、`internal/model` 五个核心包。
